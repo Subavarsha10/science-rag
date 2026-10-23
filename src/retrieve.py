@@ -2,50 +2,125 @@
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-DB_PATH = "vectorstore"
+DB_DIR = "vectorstore"
 COLLECTION_NAME = "science_ncert"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-print("Loading embedding model...")
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-client = chromadb.PersistentClient(path=DB_PATH)
-collection = client.get_collection(name=COLLECTION_NAME)
+class ScienceRetriever:
+    def __init__(self):
+        print("Loading embedding model...")
+        self.model = SentenceTransformer(EMBEDDING_MODEL)
 
-print(f"Database loaded. Total chunks: {collection.count()}")
+        self.client = chromadb.PersistentClient(path=DB_DIR)
+        self.collection = self.client.get_collection(
+            name=COLLECTION_NAME
+        )
 
-while True:
-    question = input("\nAsk a Science question (or type 'exit'): ").strip()
+        print("Connected to collection:", COLLECTION_NAME)
+        print("Total stored chunks:", self.collection.count())
 
-    if question.lower() == "exit":
-        print("Exiting retrieval test.")
-        break
+    def search(self, question, n_results=5, source_type=None):
+        """
+        Search stored NCERT and PYQ chunks.
 
-    if not question:
-        print("Please enter a question.")
-        continue
+        source_type:
+            "ncert" -> NCERT chunks (including legacy chunks without type)
+            "pyq"   -> PYQ chunks only
+            None    -> both NCERT and PYQ chunks
+        """
+        if not question or not question.strip():
+            return []
 
-    query_embedding = model.encode(
-        [question],
-        normalize_embeddings=True
-    ).tolist()
+        if source_type is not None:
+            source_type = source_type.lower()
+            if source_type not in ("ncert", "pyq"):
+                raise ValueError(
+                    "source_type must be 'ncert', 'pyq', or None"
+                )
 
-    results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=min(3, collection.count())
+        total_count = self.collection.count()
+        if total_count == 0:
+            return []
+
+        query_embedding = self.model.encode(
+            [question.strip()],
+            normalize_embeddings=True
+        ).tolist()
+
+        # Retrieve candidates from the existing collection.
+        results = self.collection.query(
+            query_embeddings=query_embedding,
+            n_results=min(total_count, max(n_results * 10, 50)),
+            include=["documents", "metadatas", "distances"]
+        )
+
+        documents = (results.get("documents") or [[]])[0] or []
+        metadatas = (results.get("metadatas") or [[]])[0] or []
+        distances = (results.get("distances") or [[]])[0] or []
+
+        matches = []
+
+        for i, document in enumerate(documents):
+            metadata = metadatas[i] or {}
+
+            # Original NCERT records have no "type" field.
+            item_type = metadata.get("type", "ncert")
+
+            if source_type is not None and item_type != source_type:
+                continue
+
+            matches.append({
+                "text": document,
+                "source": metadata.get("source", "Unknown source"),
+                "type": item_type,
+                "page": metadata.get("page"),
+                "chunk_index": metadata.get("chunk_index"),
+                "distance": (
+                    distances[i] if i < len(distances) else None
+                )
+            })
+
+            if len(matches) >= n_results:
+                break
+
+        return matches
+
+
+if __name__ == "__main__":
+    retriever = ScienceRetriever()
+
+    question = input("\nEnter a Science question: ").strip()
+    source_type = input(
+        "Source filter (ncert/pyq/all): "
+    ).strip().lower()
+
+    if source_type in ("", "all"):
+        source_type = None
+    elif source_type not in ("ncert", "pyq"):
+        print("Invalid filter. Searching all sources.")
+        source_type = None
+
+    results = retriever.search(
+        question,
+        n_results=5,
+        source_type=source_type
     )
 
-    print("\nRelevant textbook content:\n")
+    if not results:
+        print("\nNo matching content found in the retrieved candidates.")
+        print("Try another question or source filter.")
+    else:
+        for index, result in enumerate(results, start=1):
+            print(f"\n--- Result {index} ---")
+            print("Type:", result["type"].upper())
+            print("Source:", result["source"])
 
-    for i, (document, metadata, distance) in enumerate(
-        zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0]
-        ),
-        start=1
-    ):
-        print(f"--- Result {i} ---")
-        print(f"Source: {metadata['source']}")
-        print(f"Distance: {distance:.4f}")
-        print(document[:1000])
-        print()
+            if result["page"] is not None:
+                print("Page:", result["page"])
+
+            if result["distance"] is not None:
+                print("Distance:", round(result["distance"], 4))
+
+            print("Text:")
+            print(result["text"][:700])
